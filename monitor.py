@@ -2,9 +2,15 @@
 """
 清算磁区反弹监控脚本（Binance USDC永续版）
 ==========================================
-用途：监控 ETH / BTC 的 USDC 本位永续合约（Binance Futures: ETHUSDC / BTCUSDC），
+用途：监控 ETH / BTC （对标 Binance USDC本位永续合约的价格区间：ETHUSDC / BTCUSDC），
 自建"清算价格聚类"估算（无需付费清算热力图API），当价格双向接近估算出的"强磁区"（±1%以内）时，
 计算基于ATR的动态挂单缓冲价格，通过 Bark 推送提醒。
+
+重要说明（2026-09更新）：Binance合约接口(fapi.binance.com)对GitHub Actions所在的美国机房IP
+返回451拒绝访问，这是Binance的地区合规限制，不是账号或代码问题。改用Binance现货的不限地区镜像站
+(data-api.binance.vision) 获取 ETHUSDC/BTCUSDC 现货价格与K线作为替代数据源——现货价格和合约价格
+在ETH/BTC这类主流币上几乎没有偏差，不影响磁区估算的准确性。唯一的代价：现货没有"资金费率"这个概念，
+所以脚本里"多空拥挤度权重修正"这部分功能被禁用（对应变量固定为0），核心的清算聚类估算逻辑不受影响。
 
 核心假设与局限（务必了解，这不是真实清算数据，是基于公开数据的近似估算）：
 1. 无法拿到交易所真实的逐仓位持仓分布，用"历史K线收盘价 + 成交量"作为"可能的开仓价格"代理，
@@ -30,7 +36,8 @@ import requests
 # 配置区 —— 按需修改
 # ============================================================
 
-BINANCE_FAPI_BASE = "https://fapi.binance.com"
+# 注意：不用 fapi.binance.com（合约接口，美国IP会被451拒绝），改用不限地区的现货镜像站
+BINANCE_BASE = "https://data-api.binance.vision"
 
 # 监控的标的：Binance USDⓈ-M 期货上的 USDC 本位永续合约
 INSTRUMENTS = [
@@ -100,15 +107,15 @@ def save_state(state):
 
 
 def binance_get(path, params=None):
-    url = BINANCE_FAPI_BASE + path
+    url = BINANCE_BASE + path
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
 
 def get_candles(futures_symbol, interval=CANDLE_INTERVAL, limit=CANDLE_LIMIT):
-    """返回按时间正序排列的K线列表 [{ts, o, h, l, c, vol}]"""
-    raw = binance_get("/fapi/v1/klines", {
+    """返回按时间正序排列的K线列表 [{ts, o, h, l, c, vol}]（走现货镜像站，字段结构与合约K线一致）"""
+    raw = binance_get("/api/v3/klines", {
         "symbol": futures_symbol, "interval": interval, "limit": limit
     })
     candles = []
@@ -127,16 +134,14 @@ def get_candles(futures_symbol, interval=CANDLE_INTERVAL, limit=CANDLE_LIMIT):
 
 
 def get_current_price(futures_symbol):
-    raw = binance_get("/fapi/v1/ticker/price", {"symbol": futures_symbol})
+    raw = binance_get("/api/v3/ticker/price", {"symbol": futures_symbol})
     return float(raw["price"])
 
 
 def get_funding_rate(futures_symbol):
-    try:
-        raw = binance_get("/fapi/v1/premiumIndex", {"symbol": futures_symbol})
-        return float(raw["lastFundingRate"])
-    except Exception:
-        return 0.0
+    # 现货镜像站没有资金费率数据（合约概念，fapi接口被地区限制拦截），固定返回0，
+    # 相当于禁用"多空拥挤度权重修正"这个次要功能，不影响核心清算聚类估算。
+    return 0.0
 
 
 def compute_atr(candles, period=ATR_PERIOD):
