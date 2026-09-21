@@ -72,12 +72,25 @@ TRIGGER_THRESHOLD = 0.01
 # 解除冷却阈值：价格从磁区拉开 >= 2% 后，允许对同一磁区再次提醒
 RELEASE_THRESHOLD = 0.02
 
-# ATR 动态 buffer 参数：buffer_pct = ATR_K * ATR14 / current_price
+# ATR 计算周期
 ATR_PERIOD = 14
-ATR_K = 0.5
 
-# 磁区强度阈值：密度超过 均值 + STRENGTH_STD_MULT * 标准差 才算"强磁区"
+# 只在现价正负 MAGNET_RANGE_PCT 范围内找磁区，范围外的一律忽略（去掉远端噪音）
+MAGNET_RANGE_PCT = 0.05  # 5%
+
+# 磁区强度阈值：密度超过 (区间内局部均值 + STRENGTH_STD_MULT * 局部标准差) 才算"强磁区"
+# 注意：均值/标准差只在 MAGNET_RANGE_PCT 范围内计算，不再拿全局密度分布做参照，
+# 这样"够不够强"是跟现价附近的其他磁区比，而不是跟很远的历史噪声比。
 STRENGTH_STD_MULT = 1.5
+
+# 密集簇判定：从最强磁区(anchor)往价格更远的方向走，只要相邻两个"小磁区"之间的价格间隔
+# 不超过 CLUSTER_GAP_PCT，就算同一簇，一直往外延伸到间隔断开或触达 MAGNET_RANGE_PCT 边界为止。
+# 挂单价会参考这一整簇最外沿的价格（近似"插针反弹最低价"），而不是只看anchor单点。
+CLUSTER_GAP_PCT = 0.003  # 0.3%
+
+# 挂单价相对簇最外沿的微调系数：order_offset_pct = ORDER_EDGE_ATR_K * ATR14 / current_price
+# 这个值比之前小很多，因为目标点已经是簇的最深处，不需要再叠加很大的缓冲
+ORDER_EDGE_ATR_K = 0.15
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
@@ -206,59 +219,106 @@ def _add_to_bucket(density, price, current_price, weight):
     density[bucket_key] = density.get(bucket_key, 0.0) + weight
 
 
-def find_magnet_zones(density, current_price):
+def find_magnet_zone(density, current_price, direction):
     """
-    从密度分布中找出显著高于均值的"强磁区"，分别返回价格低于current_price和高于current_price中
-    离现价最近的一个强磁区（如果存在）。
+    只在 current_price 正负 MAGNET_RANGE_PCT 范围内找磁区（范围外一律忽略，去掉远端噪音）。
+    direction: 'below' (找现价下方) 或 'above' (找现价上方)
+
+    步骤：
+    1. 在范围内用局部均值+STRENGTH_STD_MULT*局部标准差筛出"够强"的候选点，取其中最强的一个作为anchor。
+       如果范围内没有任何点够强，直接返回None——不再退化去凑一个弱磁区，避免噪声。
+    2. 从anchor开始，往"离现价更远"的方向延伸：只要相邻两个磁区点（含未达阈值的小磁区）价格间隔
+       不超过CLUSTER_GAP_PCT，就并入同一簇，一直到间隔断开或触达范围边界为止。
+    3. 簇最外沿的价格 = edge_price，近似"插针反弹最低/最高价"，后面用来算挂单价。
+
+    返回 dict {"anchor_price", "anchor_weight", "edge_price", "cluster_size"} 或 None
     """
     if not density:
-        return None, None
+        return None
 
-    values = list(density.values())
-    mean_v = statistics.mean(values)
-    std_v = statistics.pstdev(values) if len(values) > 1 else 0.0
+    lo = current_price * (1 - MAGNET_RANGE_PCT)
+    hi = current_price * (1 + MAGNET_RANGE_PCT)
+
+    if direction == "below":
+        candidates = {p: w for p, w in density.items() if lo <= p < current_price}
+    else:
+        candidates = {p: w for p, w in density.items() if current_price < p <= hi}
+
+    if not candidates:
+        return None
+
+    weights = list(candidates.values())
+    mean_v = statistics.mean(weights)
+    std_v = statistics.pstdev(weights) if len(weights) > 1 else 0.0
     threshold = mean_v + STRENGTH_STD_MULT * std_v
 
-    strong_zones = [(p, w) for p, w in density.items() if w >= threshold]
-    if not strong_zones:
-        # 没有明显超阈值的，退化为取权重最高的前5个，保证监控有对象
-        strong_zones = sorted(density.items(), key=lambda x: -x[1])[:5]
+    strong = {p: w for p, w in candidates.items() if w >= threshold}
+    if not strong:
+        return None  # 范围内没有显著磁区，跳过，不勉强凑一个
 
-    below = [p for p, w in strong_zones if p < current_price]
-    above = [p for p, w in strong_zones if p > current_price]
+    anchor_price = max(strong.items(), key=lambda kv: kv[1])[0]
+    anchor_weight = strong[anchor_price]
 
-    nearest_below = max(below) if below else None
-    nearest_above = min(above) if above else None
+    all_prices_sorted = sorted(candidates.keys())
+    max_gap = current_price * CLUSTER_GAP_PCT
+    idx = all_prices_sorted.index(anchor_price)
+    cluster = [anchor_price]
 
-    return nearest_below, nearest_above
+    if direction == "below":
+        # 往更远离现价的方向 = 数组中更靠左（价格更小）
+        i = idx
+        while i > 0 and (all_prices_sorted[i] - all_prices_sorted[i - 1]) <= max_gap:
+            i -= 1
+            cluster.append(all_prices_sorted[i])
+        edge_price = min(cluster)
+    else:
+        i = idx
+        while i < len(all_prices_sorted) - 1 and (all_prices_sorted[i + 1] - all_prices_sorted[i]) <= max_gap:
+            i += 1
+            cluster.append(all_prices_sorted[i])
+        edge_price = max(cluster)
+
+    return {
+        "anchor_price": anchor_price,
+        "anchor_weight": anchor_weight,
+        "edge_price": edge_price,
+        "cluster_size": len(cluster),
+    }
 
 
 # ============================================================
 # 触发判断 + 挂单价格计算
 # ============================================================
 
-def compute_order_price(zone_price, atr, current_price, direction):
-    """direction: 'long' (下方磁区，做多反弹) 或 'short' (上方磁区，做空反弹)"""
-    buffer_pct = ATR_K * atr / current_price
+def compute_order_price(edge_price, atr, current_price, direction):
+    """
+    direction: 'long' (下方簇，做多反弹) 或 'short' (上方簇，做空反弹)
+    挂单价放在簇最外沿附近（插针反弹最低/最高价的估算），只叠加一个很小的ATR微调用于容错，
+    并强制限制在"现价这一侧"，避免挂单价反而穿到现价对面这种不合理结果。
+    """
+    edge_offset_pct = ORDER_EDGE_ATR_K * atr / current_price
     if direction == "long":
-        return zone_price * (1 + buffer_pct), buffer_pct
+        raw_order = edge_price * (1 + edge_offset_pct)
+        order_price = min(raw_order, current_price * 0.999)
     else:
-        return zone_price * (1 - buffer_pct), buffer_pct
+        raw_order = edge_price * (1 - edge_offset_pct)
+        order_price = max(raw_order, current_price * 1.001)
+    return order_price, edge_offset_pct
 
 
-def check_and_alert(symbol, direction, zone_price, current_price, atr, state):
-    if zone_price is None:
+def check_and_alert(symbol, direction, zone, current_price, atr, state):
+    """direction: 'below' 或 'above'（对应 find_magnet_zone 的方向）"""
+    if zone is None:
         return False, None
 
-    if direction == "long":
-        distance = (current_price - zone_price) / current_price
-    else:
-        distance = (zone_price - current_price) / current_price
+    anchor_price = zone["anchor_price"]
+    edge_price = zone["edge_price"]
+    cluster_size = zone["cluster_size"]
+    dir_key = "long" if direction == "below" else "short"
 
-    if distance < 0:
-        distance = abs(distance)
+    distance = abs(current_price - anchor_price) / current_price
 
-    key = f"{symbol}_{direction}"
+    key = f"{symbol}_{dir_key}"
     zone_state = state.get(key, {})
     is_cooling_down = zone_state.get("alert_active", False)
     last_zone_price = zone_state.get("zone_price")
@@ -269,26 +329,23 @@ def check_and_alert(symbol, direction, zone_price, current_price, atr, state):
             state[key] = {"alert_active": False, "zone_price": None}
             is_cooling_down = False
 
-    should_push = False
-    message = None
-
     if distance <= TRIGGER_THRESHOLD and not is_cooling_down:
-        order_price, buffer_pct = compute_order_price(zone_price, atr, current_price, direction)
-        direction_cn = "做多反弹" if direction == "long" else "做空反弹"
+        order_price, offset_pct = compute_order_price(edge_price, atr, current_price, dir_key)
+        direction_cn = "做多反弹" if dir_key == "long" else "做空反弹"
+        cluster_note = f"（含{cluster_size}个密集小磁区，已取簇最外沿）" if cluster_size > 1 else ""
         message = (
             f"当前价: {current_price:.2f}\n"
-            f"磁区价格(估算): {zone_price:.2f}\n"
-            f"距离: {distance*100:.2f}%\n"
-            f"ATR14动态buffer: {buffer_pct*100:.2f}%\n"
-            f"建议挂单价: {order_price:.2f}\n"
-            f"(注: 磁区为基于成交量/资金费率的自建估算，非真实清算数据，仅供参考)"
+            f"强磁区(anchor): {anchor_price:.2f}\n"
+            f"磁区簇最外沿: {edge_price:.2f}{cluster_note}\n"
+            f"距离(现价→anchor): {distance*100:.2f}%\n"
+            f"建议挂单价(近簇外沿): {order_price:.2f}\n"
+            f"(注: 磁区为基于成交量的自建估算，非真实清算数据，仅供参考)"
         )
-        should_push = True
-        state[key] = {"alert_active": True, "zone_price": zone_price}
-        title = f"{symbol} {'下方' if direction == 'long' else '上方'}磁区提醒 - {direction_cn}"
-        return should_push, (title, message)
+        state[key] = {"alert_active": True, "zone_price": anchor_price}
+        title = f"{symbol} {'下方' if dir_key == 'long' else '上方'}磁区提醒 - {direction_cn}"
+        return True, (title, message)
 
-    return should_push, None
+    return False, None
 
 
 # ============================================================
@@ -327,18 +384,21 @@ def run():
             continue
 
         density = build_liquidation_density(candles, current_price, funding_rate)
-        zone_below, zone_above = find_magnet_zones(density, current_price)
+        zone_below = find_magnet_zone(density, current_price, "below")
+        zone_above = find_magnet_zone(density, current_price, "above")
 
-        _, result_long = check_and_alert(symbol, "long", zone_below, current_price, atr, state)
-        _, result_short = check_and_alert(symbol, "short", zone_above, current_price, atr, state)
+        _, result_long = check_and_alert(symbol, "below", zone_below, current_price, atr, state)
+        _, result_short = check_and_alert(symbol, "above", zone_above, current_price, atr, state)
 
         if result_long:
             send_bark(*result_long)
         if result_short:
             send_bark(*result_short)
 
+        below_desc = f"anchor={zone_below['anchor_price']:.2f}/edge={zone_below['edge_price']:.2f}" if zone_below else "无"
+        above_desc = f"anchor={zone_above['anchor_price']:.2f}/edge={zone_above['edge_price']:.2f}" if zone_above else "无"
         print(f"[{symbol}] price={current_price:.2f} atr={atr:.2f} "
-              f"zone_below={zone_below} zone_above={zone_above} funding={funding_rate}")
+              f"zone_below=({below_desc}) zone_above=({above_desc})")
 
     save_state(state)
 
