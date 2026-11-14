@@ -12,7 +12,7 @@
     "zone_price": 68364.43015
   },
   "BTC_short": {
-    "alert_active": true,
-    "zone_price": 69120.21782
+    "alert_active": false,
+    "zone_price": null
   }
 }
