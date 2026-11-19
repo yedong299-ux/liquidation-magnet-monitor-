@@ -1,15 +1,15 @@
 {
   "ETH_long": {
-    "alert_active": true,
-    "zone_price": 1755.49275
+    "alert_active": false,
+    "zone_price": null
   },
   "ETH_short": {
     "alert_active": false,
     "zone_price": null
   },
   "BTC_long": {
-    "alert_active": true,
-    "zone_price": 62078.6656
+    "alert_active": false,
+    "zone_price": null
   },
   "BTC_short": {
     "alert_active": false,
