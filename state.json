@@ -8,11 +8,11 @@
     "zone_price": 1703.7406799999999
   },
   "BTC_long": {
-    "alert_active": true,
-    "zone_price": 60023.948370000006
+    "alert_active": false,
+    "zone_price": null
   },
   "BTC_short": {
-    "alert_active": true,
-    "zone_price": 60007.130000000005
+    "alert_active": false,
+    "zone_price": null
   }
 }
